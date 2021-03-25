@@ -18,6 +18,7 @@ package header
 
 import (
 	"encoding/binary"
+	"fmt"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
@@ -233,4 +234,151 @@ func PseudoHeaderChecksum(protocol tcpip.TransportProtocolNumber, srcAddr tcpip.
 	xsum = Checksum(tmp, xsum)
 
 	return Checksum([]byte{0, uint8(protocol)}, xsum)
+}
+
+// checksumUpdate2ByteAlignedUint16 updates a uint16 value in a calculated
+// checksum.
+//
+// The value MUST begin at a 2-byte boundary in the original buffer.
+func checksumUpdate2ByteAlignedUint16(xsum, old, new uint16) uint16 {
+	// As per RFC 1071 page 4,
+	//	(4)  Incremental Update
+	//
+	//        ...
+	//
+	//        To update the checksum, simply add the differences of the
+	//        sixteen bit integers that have been changed.  To see why this
+	//        works, observe that every 16-bit integer has an additive inverse
+	//        and that addition is associative.  From this it follows that
+	//        given the original value m, the new value m', and the old
+	//        checksum C, the new checksum C' is:
+	//
+	//                C' = C + (-m) + m' = C + (m' - m)
+	return ChecksumCombine(xsum, ChecksumCombine(new, ^old))
+}
+
+// checksumUpdate2ByteAlignedAddress updates an address in a calculated
+// checksum.
+//
+// The addresses must have the same length and must contain an even number
+// of bytes. The address MUST begin at a 2-byte boundary in the original buffer.
+func checksumUpdate2ByteAlignedAddress(xsum uint16, old, new tcpip.Address) uint16 {
+	const uint16Bytes = 2
+
+	if len(old) != len(new) {
+		panic(fmt.Sprintf("buffer lengths are different; old = %d, new = %d", len(old), len(new)))
+	}
+
+	if len(old)%uint16Bytes != 0 {
+		panic(fmt.Sprintf("buffer has an odd number of bytes; got = %d", len(old)))
+	}
+
+	// As per RFC 1071 page 4,
+	//	(4)  Incremental Update
+	//
+	//        ...
+	//
+	//        To update the checksum, simply add the differences of the
+	//        sixteen bit integers that have been changed.  To see why this
+	//        works, observe that every 16-bit integer has an additive inverse
+	//        and that addition is associative.  From this it follows that
+	//        given the original value m, the new value m', and the old
+	//        checksum C, the new checksum C' is:
+	//
+	//                C' = C + (-m) + m' = C + (m' - m)
+	for len(old) != 0 {
+		// Convert the 2 byte sequences to uint16 values then apply the increment
+		// update.
+		xsum = checksumUpdate2ByteAlignedUint16(xsum, (uint16(old[0])<<8)+uint16(old[1]), (uint16(new[0])<<8)+uint16(new[1]))
+		old = old[uint16Bytes:]
+		new = new[uint16Bytes:]
+	}
+
+	return xsum
+}
+
+// ChecksumStatus is the state of a checksum.
+type ChecksumStatus int
+
+const (
+	// ChecksumNotNeeded indicates that checksum calculation is not required.
+	ChecksumNotNeeded ChecksumStatus = iota
+
+	// ChecksumNone indicates that checksum calculation has not been performed.
+	ChecksumNone
+
+	// ChecksumPartial indicates that the checksum field of a header is a
+	// reflection of the pseudo header only.
+	ChecksumPartial
+
+	// ChecksumCalculated indicates that the checksum field of a header is a
+	// reflection of the pseudo header and the layer the checksum is protecting.
+	ChecksumCalculated
+)
+
+func (c ChecksumStatus) IncludesPseudoHeader() bool {
+	switch c {
+	case ChecksumNotNeeded, ChecksumNone:
+		return false
+	case ChecksumPartial, ChecksumCalculated:
+		return true
+	default:
+		panic(fmt.Sprintf("unhandled ChecksumStatus = %d", c))
+	}
+}
+
+func (c ChecksumStatus) FullChecksum() bool {
+	switch c {
+	case ChecksumNotNeeded, ChecksumNone, ChecksumPartial:
+		return false
+	case ChecksumCalculated:
+		return true
+	default:
+		panic(fmt.Sprintf("unhandled ChecksumStatus = %d", c))
+	}
+}
+
+// UpdateTransportChecksum updates the checksum of a packet to match the
+// target transport checksum status.
+func UpdateTransportChecksum(proto tcpip.TransportProtocolNumber, current, target ChecksumStatus, xsum uint16, srcAddr, dstAddr tcpip.Address, transportHdr buffer.View, dataSize uint16, dataChecksum func() uint16) uint16 {
+	switch target {
+	case ChecksumNone:
+		panic("ChecksumNone should never be a target checksum status")
+	case ChecksumNotNeeded:
+		return 0
+	case ChecksumPartial:
+		switch current {
+		case ChecksumNotNeeded:
+			return 0
+		case ChecksumCalculated:
+			// We have no way to signal to an interface that the full checksum is
+			// already calculated so we just calculate the partial checksum here
+			// and let the NIC recalculate the checksum.
+			fallthrough
+		case ChecksumNone:
+			return PseudoHeaderChecksum(proto, srcAddr, dstAddr, dataSize+uint16(len(transportHdr)))
+		case ChecksumPartial:
+			// Nothing further to do.
+			return xsum
+		default:
+			panic(fmt.Sprintf("unhandled TransportChecksumStatus = %d", current))
+		}
+	case ChecksumCalculated:
+		switch current {
+		case ChecksumNotNeeded:
+			return 0
+		case ChecksumNone:
+			xsum = PseudoHeaderChecksum(proto, srcAddr, dstAddr, dataSize+uint16(len(transportHdr)))
+			fallthrough
+		case ChecksumPartial:
+			return ^ChecksumCombine(Checksum(transportHdr, xsum), dataChecksum())
+		case ChecksumCalculated:
+			// Nothing further to do.
+			return xsum
+		default:
+			panic(fmt.Sprintf("unhandled TransportChecksumStatus = %d", current))
+		}
+	default:
+		panic(fmt.Sprintf("unhandled TransportChecksumStatus = %d", target))
+	}
 }

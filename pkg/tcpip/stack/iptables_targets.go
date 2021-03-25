@@ -29,7 +29,7 @@ type AcceptTarget struct {
 }
 
 // Action implements Target.Action.
-func (*AcceptTarget) Action(*PacketBuffer, *ConnTrack, Hook, *Route, tcpip.Address) (RuleVerdict, int) {
+func (*AcceptTarget) Action(*PacketBuffer, *ConnTrack, Hook, tcpip.Address) (RuleVerdict, int) {
 	return RuleAccept, 0
 }
 
@@ -40,7 +40,7 @@ type DropTarget struct {
 }
 
 // Action implements Target.Action.
-func (*DropTarget) Action(*PacketBuffer, *ConnTrack, Hook, *Route, tcpip.Address) (RuleVerdict, int) {
+func (*DropTarget) Action(*PacketBuffer, *ConnTrack, Hook, tcpip.Address) (RuleVerdict, int) {
 	return RuleDrop, 0
 }
 
@@ -52,7 +52,7 @@ type ErrorTarget struct {
 }
 
 // Action implements Target.Action.
-func (*ErrorTarget) Action(*PacketBuffer, *ConnTrack, Hook, *Route, tcpip.Address) (RuleVerdict, int) {
+func (*ErrorTarget) Action(*PacketBuffer, *ConnTrack, Hook, tcpip.Address) (RuleVerdict, int) {
 	log.Debugf("ErrorTarget triggered.")
 	return RuleDrop, 0
 }
@@ -67,7 +67,7 @@ type UserChainTarget struct {
 }
 
 // Action implements Target.Action.
-func (*UserChainTarget) Action(*PacketBuffer, *ConnTrack, Hook, *Route, tcpip.Address) (RuleVerdict, int) {
+func (*UserChainTarget) Action(*PacketBuffer, *ConnTrack, Hook, tcpip.Address) (RuleVerdict, int) {
 	panic("UserChainTarget should never be called.")
 }
 
@@ -79,7 +79,7 @@ type ReturnTarget struct {
 }
 
 // Action implements Target.Action.
-func (*ReturnTarget) Action(*PacketBuffer, *ConnTrack, Hook, *Route, tcpip.Address) (RuleVerdict, int) {
+func (*ReturnTarget) Action(*PacketBuffer, *ConnTrack, Hook, tcpip.Address) (RuleVerdict, int) {
 	return RuleReturn, 0
 }
 
@@ -97,7 +97,7 @@ type RedirectTarget struct {
 }
 
 // Action implements Target.Action.
-func (rt *RedirectTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, r *Route, address tcpip.Address) (RuleVerdict, int) {
+func (rt *RedirectTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, address tcpip.Address) (RuleVerdict, int) {
 	// Sanity check.
 	if rt.NetworkProtocol != pkt.NetworkProtocolNumber {
 		panic(fmt.Sprintf(
@@ -133,29 +133,22 @@ func (rt *RedirectTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, r 
 	switch protocol := pkt.TransportProtocolNumber; protocol {
 	case header.UDPProtocolNumber:
 		udpHeader := header.UDP(pkt.TransportHeader().View())
-		udpHeader.SetDestinationPort(rt.Port)
 
-		// Calculate UDP checksum and set it.
 		if hook == Output {
-			udpHeader.SetChecksum(0)
-			netHeader := pkt.Network()
-			netHeader.SetDestinationAddress(address)
-
 			// Only calculate the checksum if offloading isn't supported.
-			if r.RequiresTXTransportChecksum() {
-				length := uint16(pkt.Size()) - uint16(len(pkt.NetworkHeader().View()))
-				xsum := header.PseudoHeaderChecksum(protocol, netHeader.SourceAddress(), netHeader.DestinationAddress(), length)
-				xsum = header.ChecksumCombine(xsum, pkt.Data().AsRange().Checksum())
-				udpHeader.SetChecksum(^udpHeader.CalculateChecksum(xsum))
-			}
+			rewritePacket(
+				pkt.Network(),
+				udpHeader,
+				false, /* updateSRCFields */
+				pkt.TransportChecksumStatus.FullChecksum(),
+				pkt.TransportChecksumStatus.IncludesPseudoHeader(),
+				rt.Port,
+				address,
+			)
+		} else {
+			udpHeader.SetDestinationPort(rt.Port)
 		}
 
-		// After modification, IPv4 packets need a valid checksum.
-		if pkt.NetworkProtocolNumber == header.IPv4ProtocolNumber {
-			netHeader := header.IPv4(pkt.NetworkHeader().View())
-			netHeader.SetChecksum(0)
-			netHeader.SetChecksum(^netHeader.CalculateChecksum())
-		}
 		pkt.NatDone = true
 	case header.TCPProtocolNumber:
 		if ct == nil {
@@ -166,7 +159,7 @@ func (rt *RedirectTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, r 
 		// packet of the connection comes here. Other packets will be
 		// manipulated in connection tracking.
 		if conn := ct.insertRedirectConn(pkt, hook, rt.Port, address); conn != nil {
-			ct.handlePacket(pkt, hook, r)
+			ct.handlePacket(pkt, hook)
 		}
 	default:
 		return RuleDrop, 0
@@ -186,7 +179,7 @@ type SNATTarget struct {
 }
 
 // Action implements Target.Action.
-func (st *SNATTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, r *Route, address tcpip.Address) (RuleVerdict, int) {
+func (st *SNATTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, address tcpip.Address) (RuleVerdict, int) {
 	// Sanity check.
 	if st.NetworkProtocol != pkt.NetworkProtocolNumber {
 		panic(fmt.Sprintf(
@@ -214,26 +207,17 @@ func (st *SNATTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, r *Rou
 
 	switch protocol := pkt.TransportProtocolNumber; protocol {
 	case header.UDPProtocolNumber:
-		udpHeader := header.UDP(pkt.TransportHeader().View())
-		udpHeader.SetChecksum(0)
-		udpHeader.SetSourcePort(st.Port)
-		netHeader := pkt.Network()
-		netHeader.SetSourceAddress(st.Addr)
-
 		// Only calculate the checksum if offloading isn't supported.
-		if r.RequiresTXTransportChecksum() {
-			length := uint16(pkt.Size()) - uint16(len(pkt.NetworkHeader().View()))
-			xsum := header.PseudoHeaderChecksum(protocol, netHeader.SourceAddress(), netHeader.DestinationAddress(), length)
-			xsum = header.ChecksumCombine(xsum, pkt.Data().AsRange().Checksum())
-			udpHeader.SetChecksum(^udpHeader.CalculateChecksum(xsum))
-		}
+		rewritePacket(
+			pkt.Network(),
+			header.UDP(pkt.TransportHeader().View()),
+			true, /* updateSRCFields */
+			pkt.TransportChecksumStatus.FullChecksum(),
+			pkt.TransportChecksumStatus.IncludesPseudoHeader(),
+			st.Port,
+			st.Addr,
+		)
 
-		// After modification, IPv4 packets need a valid checksum.
-		if pkt.NetworkProtocolNumber == header.IPv4ProtocolNumber {
-			netHeader := header.IPv4(pkt.NetworkHeader().View())
-			netHeader.SetChecksum(0)
-			netHeader.SetChecksum(^netHeader.CalculateChecksum())
-		}
 		pkt.NatDone = true
 	case header.TCPProtocolNumber:
 		if ct == nil {
@@ -244,11 +228,42 @@ func (st *SNATTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, r *Rou
 		// packet of the connection comes here. Other packets will be
 		// manipulated in connection tracking.
 		if conn := ct.insertSNATConn(pkt, hook, st.Port, st.Addr); conn != nil {
-			ct.handlePacket(pkt, hook, r)
+			ct.handlePacket(pkt, hook)
 		}
 	default:
 		return RuleDrop, 0
 	}
 
 	return RuleAccept, 0
+}
+
+func rewritePacket(n header.Network, t header.ChecksummableTransport, updateSRCFields, fullChecksum, updatePseudoHeader bool, newPort uint16, newAddr tcpip.Address) {
+	if updateSRCFields {
+		t.UpdateSourcePortAndMaybeChecksum(newPort, fullChecksum)
+	} else {
+		t.UpdateDestinationPortAndMaybeChecksum(newPort, fullChecksum)
+	}
+
+	if updatePseudoHeader {
+		var oldAddr tcpip.Address
+		if updateSRCFields {
+			oldAddr = n.SourceAddress()
+		} else {
+			oldAddr = n.DestinationAddress()
+		}
+
+		t.UpdateChecksumPseudoHeaderAddress(oldAddr, newAddr, fullChecksum)
+	}
+
+	if checksummableNetHeader, ok := n.(header.ChecksummableNetwork); ok {
+		if updateSRCFields {
+			checksummableNetHeader.UpdateSourceAddressAndChecksum(newAddr)
+		} else {
+			checksummableNetHeader.UpdateDestinationAddressAndChecksum(newAddr)
+		}
+	} else if updateSRCFields {
+		n.SetSourceAddress(newAddr)
+	} else {
+		n.SetDestinationAddress(newAddr)
+	}
 }

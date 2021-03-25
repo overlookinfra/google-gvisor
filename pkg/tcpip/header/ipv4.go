@@ -305,6 +305,18 @@ func (b IPv4) DestinationAddress() tcpip.Address {
 	return tcpip.Address(b[dstAddr : dstAddr+IPv4AddressSize])
 }
 
+// UpdateSourceAddressAndChecksum implements ChecksummableNetwork.
+func (b IPv4) UpdateSourceAddressAndChecksum(new tcpip.Address) {
+	b.SetChecksum(^checksumUpdate2ByteAlignedAddress(^b.Checksum(), b.SourceAddress(), new))
+	b.SetSourceAddress(new)
+}
+
+// UpdateDestinationAddressAndChecksum implements ChecksummableNetwork.
+func (b IPv4) UpdateDestinationAddressAndChecksum(new tcpip.Address) {
+	b.SetChecksum(^checksumUpdate2ByteAlignedAddress(^b.Checksum(), b.DestinationAddress(), new))
+	b.SetDestinationAddress(new)
+}
+
 // padIPv4OptionsLength returns the total length for IPv4 options of length l
 // after applying padding according to RFC 791:
 //    The internet header padding is used to ensure that the internet
@@ -345,6 +357,17 @@ func (b IPv4) TOS() (uint8, uint32) {
 // SetTOS sets the "type of service" field of the IPv4 header.
 func (b IPv4) SetTOS(v uint8, _ uint32) {
 	b[tos] = v
+}
+
+// SetPacketSize implements Network.
+func (b IPv4) SetPacketSize(v uint16) {
+	b.SetTotalLength(v)
+}
+
+// CalculateAndSetChecksum implements ChecksummableNetwork.
+func (b IPv4) CalculateAndSetChecksum() {
+	b.SetChecksum(0)
+	b.SetChecksum(^b.CalculateChecksum())
 }
 
 // SetTTL sets the "Time to Live" field of the IPv4 header.
