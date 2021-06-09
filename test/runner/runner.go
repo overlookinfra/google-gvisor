@@ -49,6 +49,7 @@ var (
 	overlay    = flag.Bool("overlay", false, "wrap filesystem mounts with writable tmpfs overlay")
 	vfs2       = flag.Bool("vfs2", false, "enable VFS2")
 	fuse       = flag.Bool("fuse", false, "enable FUSE")
+	container  = flag.Bool("container", false, "run tests in their own namespaces (user ns, network ns, etc), pretending to be root")
 	runscPath  = flag.String("runsc", "", "path to runsc binary")
 
 	addUDSTree = flag.Bool("add-uds-tree", false, "expose a tree of UDS utilities for use in tests")
@@ -104,6 +105,24 @@ func runTestCaseNative(testBin string, tc gtest.TestCase, t *testing.T) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &unix.SysProcAttr{}
+
+	if *container {
+		cmd.SysProcAttr = &unix.SysProcAttr{
+			Cloneflags: unix.CLONE_NEWUSER | unix.CLONE_NEWNET | unix.CLONE_NEWIPC | unix.CLONE_NEWUTS,
+			// Set current user/group as root inside the namespace.
+			UidMappings: []syscall.SysProcIDMap{
+				{ContainerID: 0, HostID: os.Getuid(), Size: 1},
+			},
+			GidMappings: []syscall.SysProcIDMap{
+				{ContainerID: 0, HostID: os.Getgid(), Size: 1},
+			},
+			GidMappingsEnableSetgroups: false,
+			Credential: &syscall.Credential{
+				Uid: 0,
+				Gid: 0,
+			},
+		}
+	}
 
 	if specutils.HasCapabilities(capability.CAP_SYS_ADMIN) {
 		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWUTS
