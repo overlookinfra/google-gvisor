@@ -1182,6 +1182,46 @@ TEST_P(SimpleTcpSocketTest, SelfConnectSend) {
   EXPECT_THAT(shutdown(s.get(), SHUT_WR), SyscallSucceedsWithValue(0));
 }
 
+TEST_P(SimpleTcpSocketTest, SelfConnectSendShutdownWrite) {
+  // Initialize address to the loopback one.
+  sockaddr_storage addr =
+      ASSERT_NO_ERRNO_AND_VALUE(InetLoopbackAddr(GetParam()));
+  socklen_t addrlen = sizeof(addr);
+
+  const FileDescriptor s =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+
+  constexpr int max_seg = 256;
+  ASSERT_THAT(
+      setsockopt(s.get(), SOL_TCP, TCP_MAXSEG, &max_seg, sizeof(max_seg)),
+      SyscallSucceeds());
+
+  ASSERT_THAT(bind(s.get(), AsSockAddr(&addr), addrlen), SyscallSucceeds());
+  // Get the bound port.
+  ASSERT_THAT(getsockname(s.get(), AsSockAddr(&addr), &addrlen),
+              SyscallSucceeds());
+  ASSERT_THAT(RetryEINTR(connect)(s.get(), AsSockAddr(&addr), addrlen),
+              SyscallSucceeds());
+
+  // Ensure the write buffer is large enough not to block on a single write.
+  size_t write_size = 512 << 20;  // 512 MiB.
+  EXPECT_THAT(setsockopt(s.get(), SOL_SOCKET, SO_SNDBUF, &write_size,
+                         sizeof(write_size)),
+              SyscallSucceedsWithValue(0));
+
+  std::vector<char> writebuf(write_size);
+
+  ScopedThread t([&s]() {
+    absl::SleepFor(absl::Milliseconds(250));
+    ASSERT_THAT(shutdown(s.get(), SHUT_WR), SyscallSucceeds());
+  });
+
+  // Try to send the whole thing.
+  int n;
+  ASSERT_THAT(n = SendFd(s.get(), writebuf.data(), writebuf.size(), 0),
+              SyscallFailsWithErrno(EPIPE));
+}
+
 void NonBlockingConnect(int family, int16_t pollMask) {
   const FileDescriptor listener =
       ASSERT_NO_ERRNO_AND_VALUE(Socket(family, SOCK_STREAM, IPPROTO_TCP));

@@ -2394,6 +2394,8 @@ func (e *endpoint) shutdownLocked(flags tcpip.ShutdownFlags) tcpip.Error {
 			e.sndQueueInfo.SndClosed = true
 			e.sndQueueInfo.sndQueueMu.Unlock()
 			e.handleClose()
+			// Notify any writers that the endpoint is shutdown for writing.
+			e.waiterQueue.Notify(waiter.EventHUp)
 		}
 
 		return nil

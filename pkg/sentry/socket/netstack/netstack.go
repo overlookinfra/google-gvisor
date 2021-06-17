@@ -2870,7 +2870,7 @@ func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []b
 				// We'll have to block. Register for notification and keep trying to
 				// send all the data.
 				entry, ch = waiter.NewChannelEntry(nil)
-				s.EventRegister(&entry, waiter.WritableEvents)
+				s.EventRegister(&entry, waiter.WritableEvents|waiter.EventHUp|waiter.EventErr)
 				defer s.EventUnregister(&entry)
 			} else {
 				// Don't wait immediately after registration in case more data
